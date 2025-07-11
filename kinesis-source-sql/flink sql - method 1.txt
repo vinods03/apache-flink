@@ -1,0 +1,93 @@
+Summary:
+
+There is a raw table with kinesis connector and a processed table with filesystem connector.
+Multiple challenges / errors faced, but the main issue seems to be that the insert statement that loads from raw to processed table behaves unpredictably, sometimees continues to run and sometimes fails (probably when no data is there to process in raw table ?). Even the select statements were going through fine someetimes and sometimes failing.
+Mutiple hops resulting in multiple points of failure.
+
+Later, i found that there were a lot of data issues in the source files FUTURES_TRADES.txt that is used to push data into kinesis data stream.
+There were unexpected commas, missing characters, the special character for Carriage Return etc.
+I cleaned it up manually.
+Also changed date format from 2000/01/01 to 2000-01-01. This was probably not required.
+After doing all the above changes, i really did not test out the steps listed below.
+However, anyway, flink sql - method 2 is more efficient.
+
+
+========================================================================================
+
+
+%flink.ssql
+
+drop table if exists kinesis_stock_data_analysis_raw;
+
+create table kinesis_stock_data_analysis_raw
+(
+raw_data STRING,
+`arrival_time` TIMESTAMP(3) METADATA FROM 'timestamp' VIRTUAL, 
+`shard_id` VARCHAR(128) NOT NULL METADATA FROM 'shard-id' VIRTUAL,
+`sequence_number` VARCHAR(128) NOT NULL METADATA FROM 'sequence-number' VIRTUAL
+) WITH (
+'connector' = 'kinesis',
+'stream' = 'vinod-apache-flink-kinesis-stream',
+'aws.region' = 'us-east-1',
+'scan.stream.initpos' = 'LATEST',
+'format' = 'raw'
+)
+
+
+========================================================================================
+
+
+%flink.ssql
+
+drop table if exists kinesis_stock_data_analysis_processed;
+
+create table kinesis_stock_data_analysis_processed
+(
+trade_ts STRING,
+trade_value FLOAT,
+trade_volume INT
+) WITH (
+'connector' = 'filesystem',
+'path' = 's3://vinod-apache-flink/kinesis-based',
+'format' = 'csv'
+)
+
+========================================================================================
+
+-- below failing with error:
+-- Caused by: java.lang.RuntimeException: Retries exceeded for getRecords operation - all 3 retry attempts failed.
+-- at org.apache.flink.streaming.connectors.kinesis.proxy.KinesisProxy.getRecords(KinesisProxy.java:320)
+-- at org.apache.flink.streaming.connectors.kinesis.internals.publisher.polling.PollingRecordPublisher.getRecords(PollingRecordPublisher.java:168)
+
+%flink.ssql(type=update)
+
+insert into kinesis_stock_data_analysis_processed
+select 
+split_index(raw_data,',', 0),
+CAST(split_index(raw_data,',', 1) AS FLOAT),
+CAST(split_index(raw_data,',', 2) AS INT)
+from kinesis_stock_data_analysis_raw;
+
+========================================================================================
+
+-- below showed records but also failing with error:
+-- Caused by: java.lang.RuntimeException: Retries exceeded for getRecords operation - all 3 retry attempts failed.
+-- at org.apache.flink.streaming.connectors.kinesis.proxy.KinesisProxy.getRecords(KinesisProxy.java:320)
+-- at org.apache.flink.streaming.connectors.kinesis.internals.publisher.polling.PollingRecordPublisher.getRecords(PollingRecordPublisher.java:168)
+
+
+%flink.ssql
+
+select * from kinesis_stock_data_analysis_raw;
+
+========================================================================================
+
+-- below showed records
+-- but failed with error
+-- before consuming records from raw table : Caused by: java.lang.RuntimeException: Row length mismatch. 3 fields expected but was 1
+-- after consuming records from raw table: CharConversionException: Invalid UTF-8 start byte 0x9c (at char #11, byte #9): check content encoding, does not look like UTF-8
+
+%flink.ssql
+
+select * from kinesis_stock_data_analysis_processed;
+

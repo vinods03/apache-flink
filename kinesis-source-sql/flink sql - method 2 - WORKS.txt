@@ -1,0 +1,194 @@
+Summary:
+
+A single table here, so no mutiple hops / multiple points of failure.
+Note that here we have a csv table (not raw table) with kinesis connector.
+If you have format as raw, you will get all columns in a single field and then you have to separate them out - this results in multiple hops / challenges / points of failure.
+
+Within same window, avg, sum, max, min works fine.
+Across windows, comparision of max_trade_value this window ve previous window -> not working.
+
+
+Note, Special characters like CR in FUTURES_TRADES.txt were causing issue .. open file in notepad++ -> View -> Show Symbol -> Show All Characters -> you will be able to see these characters. Replace these - CTRL+H - \r with empty string.
+
+========================================================================================
+
+
+%flink.ssql
+
+
+drop table if exists kinesis_stock_data_analysis_raw;
+
+create table kinesis_stock_data_analysis_raw
+(
+trade_ts TIMESTAMP(3),
+trade_value FLOAT,
+trade_volume INT,
+`arrival_time` TIMESTAMP(3) METADATA FROM 'timestamp' VIRTUAL, 
+`shard_id` VARCHAR(128) NOT NULL METADATA FROM 'shard-id' VIRTUAL,
+`sequence_number` VARCHAR(128) NOT NULL METADATA FROM 'sequence-number' VIRTUAL,
+WATERMARK for trade_ts AS trade_ts - INTERVAL '5' SECOND
+) WITH (
+'connector' = 'kinesis',
+'stream' = 'vinod-apache-flink-kinesis-stream',
+'aws.region' = 'us-east-1',
+'scan.stream.initpos' = 'LATEST',
+'format' = 'csv'
+);
+
+
+===============================================================
+
+
+%flink.ssql
+
+select * from kinesis_stock_data_analysis_raw;
+
+
+============================================================ SAME WINDOW ===============================================
+
+%flink.ssql
+
+drop temporary view if exists kinesis_stock_data_analysis_window;
+
+create temporary view kinesis_stock_data_analysis_window
+as
+select 
+window_start,
+window_end,
+avg(trade_value) as avg_trade_value,
+max(trade_value) as max_trade_value,
+min(trade_value) as min_trade_value,
+sum(trade_value) as total_trade_value,
+avg(trade_volume) as avg_trade_volume,
+max(trade_volume) as max_trade_volume,
+min(trade_volume) as min_trade_volume,
+sum(trade_volume) as total_trade_volume
+from TABLE(
+        TUMBLE(
+                DATA => TABLE kinesis_stock_data_analysis_raw,
+                TIMECOL => DESCRIPTOR(trade_ts),
+                SIZE => INTERVAL '10' SECOND
+              )
+            )
+GROUP BY window_start, window_end;
+
+
+============================================================
+
+%flink.ssql
+
+select * from kinesis_stock_data_analysis_window;
+
+=============================================================== ACROSS WINDOWS ==============================================
+
+================================================================ NOT WORKING =================================================
+
+
+select 
+window_start, 
+window_end, 
+avg_trade_value, 
+lag(avg_trade_value, 1) over (partition by window_start order by window_end)
+from kinesis_stock_data_analysis_window;
+
+fails with error:
+TableException: OVER windows' ordering in stream mode must be defined on a time attribute.
+
+So tried to create a table instead of view with watermark defined:
+
+
+====================================================================
+
+
+%flink.ssql
+
+drop table if exists kinesis_stock_data_analysis_processed;
+
+create table kinesis_stock_data_analysis_processed
+(
+window_start TIMESTAMP(3),
+window_end TIMESTAMP(3),
+avg_trade_value FLOAT,
+max_trade_value FLOAT,
+min_trade_value FLOAT,
+total_trade_value FLOAT,
+avg_trade_volume INT,
+max_trade_volume INT,
+min_trade_volume INT,
+total_trade_volume INT,
+WATERMARK for window_start AS window_start - INTERVAL '5' SECOND
+) 
+WITH (
+'connector' = 'filesystem',
+'path' = 's3a://vinod-apache-flink/kinesis-based/flink-sink',
+'format' = 'csv',
+'sink.partition-commit.policy.kind' = 'success-file',
+'sink.partition-commit.delay' = '1 min'
+);
+
+
+===============================================================
+
+%flink.pyflink
+
+st_env.get_config().get_configuration().set_string(
+"execution.checkpointing.mode","EXACTLY_ONCE"
+)
+
+st_env.get_config().get_configuration().set_string(
+"execution.checkpointing.interval","1min"
+)
+
+
+===============================================================
+
+
+%flink.ssql(type=update)
+
+insert into kinesis_stock_data_analysis_processed
+select 
+window_start,
+window_end,
+avg(trade_value) as avg_trade_value,
+max(trade_value) as max_trade_value,
+min(trade_value) as min_trade_value,
+sum(trade_value) as total_trade_value,
+avg(trade_volume) as avg_trade_volume,
+max(trade_volume) as max_trade_volume,
+min(trade_volume) as min_trade_volume,
+sum(trade_volume) as total_trade_volume
+from TABLE(
+        TUMBLE(
+                DATA => TABLE kinesis_stock_data_analysis_raw,
+                TIMECOL => DESCRIPTOR(trade_ts),
+                SIZE => INTERVAL '10' SECOND
+              )
+            )
+GROUP BY window_start, window_end;
+
+this is working but below is not working:
+
+select * from kinesis_stock_data_analysis_processed;
+
+failing with error:
+CharConversionException: Invalid UTF-8 start byte 0x9c (at char #11, byte #9): check content encoding, does not look like UTF-8
+when path was 'path' = 's3://vinod-apache-flink/kinesis-based'
+
+when path was changed to 'path' = 's3://vinod-apache-flink/kinesis-based/flink-sink'
+this error did not come but no data returned because the insert statement did not create any file/folder in the s3 path.
+
+
+================================================================
+
+if above works, we should be able to use:
+
+select 
+window_start, 
+window_end, 
+avg_trade_value, 
+lag(avg_trade_value, 1) over (partition by window_start order by window_start)
+from kinesis_stock_data_analysis_processed;
+
+=================================================================
+
+
